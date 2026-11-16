@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+*.err
+data/*.csv
+data/*.joblib
+data/*.pt
+data/*.json
+data/node*_metrics.csv
