@@ -9,6 +9,7 @@ from edge_network.tasks import execute
 class State:
     def __init__(self, name):
         self.name=name; self.waiting=0; self.running=0; self.lock=threading.Lock(); self.slots=threading.BoundedSemaphore(2)
+        self.enabled=True; self.load_percent=0; self.load_memory_mb=0; self.control_lock=threading.Lock(); self.control_stop=None; self.control_thread=None
         self.process=psutil.Process(); self.metric_lock=threading.Lock(); self.process.cpu_percent(interval=None)
         self.last_sample={"timestamp":time.time(),"node":name,"cpu_percent":0.0,"ram_percent":self.process.memory_percent(),
                           "memory_mb":self.process.memory_info().rss/(1024*1024),"queue":0,"running":0,"source":"process_sampler"}
@@ -36,6 +37,9 @@ class Handler(socketserver.StreamRequestHandler):
                 with state.lock: waiting,running=state.waiting,state.running
                 response=self.status(waiting,running)
             elif request.get("action")=="run":
+                if not state.enabled:
+                    response={"ok":False,"error":"Node is disabled" ,"node":state.name}
+                    self.wfile.write((json.dumps(response)+"\n").encode()); return
                 with state.lock: state.waiting+=1
                 state.slots.acquire()
                 with state.lock: state.waiting-=1; state.running+=1
@@ -109,6 +113,16 @@ class Handler(socketserver.StreamRequestHandler):
                     except Exception:
                         state.slots.release()
                         raise
+            elif request.get("action")=="set_enabled":
+                state.enabled=bool(request.get("enabled",True))
+                if not state.enabled:
+                    self.set_control_load(0)
+                response={"ok":True,"node":state.name,"enabled":state.enabled}
+            elif request.get("action")=="set_load":
+                percent=max(0,min(100,int(request.get("percent",0))))
+                memory_mb=max(0,min(128,int(request.get("memory_mb",round(percent*0.64)))))
+                self.set_control_load(percent,memory_mb)
+                response={"ok":True,"node":state.name,"load_percent":percent,"load_memory_mb":memory_mb}
             elif request.get("action")=="ping": response={"ok":True,"node":state.name,"time":time.time()}
             else: response={"ok":False,"error":"Unknown action"}
             self.wfile.write((json.dumps(response)+"\n").encode())
@@ -122,7 +136,39 @@ class Handler(socketserver.StreamRequestHandler):
     def status(waiting,running):
         sample=state.latest()
         return {"ok":True,"node":state.name,"cpu_percent":sample["cpu_percent"],"ram_percent":sample["ram_percent"],
-                "memory_mb":sample["memory_mb"],"queue":waiting,"running":running,"timestamp":time.time()}
+                "memory_mb":sample["memory_mb"],"queue":waiting,"running":running,"enabled":state.enabled,
+                "load_percent":state.load_percent,"load_memory_mb":state.load_memory_mb,"timestamp":time.time()}
+    @staticmethod
+    def set_control_load(percent,memory_mb=0):
+        with state.control_lock:
+            if state.control_stop is not None:
+                state.control_stop.set()
+                if state.control_thread is not None: state.control_thread.join(timeout=1)
+                state.control_stop=None; state.control_thread=None
+            state.load_percent=percent; state.load_memory_mb=memory_mb
+            if percent<=0 or not state.enabled: return
+            if not state.slots.acquire(blocking=False):
+                state.load_percent=0; state.load_memory_mb=0
+                raise RuntimeError("No worker slot available; retry after current tasks finish")
+            stop=threading.Event(); state.control_stop=stop
+            memory=bytearray(memory_mb*1024*1024)
+            for offset in range(0,len(memory),4096): memory[offset]=1
+            holder=[memory]
+            with state.lock: state.running+=1
+            def background():
+                value=0.0; cycle_s=.1
+                try:
+                    while not stop.is_set():
+                        cycle_end=time.perf_counter()+cycle_s
+                        busy_until=time.perf_counter()+cycle_s*percent/100
+                        while time.perf_counter()<busy_until and not stop.is_set():
+                            for i in range(3000): value+=(i%97)*.000001
+                        stop.wait(max(0,cycle_end-time.perf_counter()))
+                finally:
+                    holder.clear()
+                    with state.lock: state.running=max(0,state.running-1)
+                    state.slots.release()
+            state.control_thread=threading.Thread(target=background,daemon=True); state.control_thread.start()
 
 def monitor():
     while True:

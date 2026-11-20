@@ -17,10 +17,14 @@ def central_features(task,metrics):
 def collect():
     rows=[]
     for name,host,port in NODES:
-        before=time.perf_counter(); status=send_request(host,port,{"action":"status"}); latency=(time.perf_counter()-before)*500
+        before=time.perf_counter()
+        try: status=send_request(host,port,{"action":"status"},timeout=1.0); latency=(time.perf_counter()-before)*500
+        except Exception as error:
+            latency=(time.perf_counter()-before)*500
+            status={"ok":False,"enabled":False,"error":str(error),"cpu_percent":0,"ram_percent":0,"memory_mb":0,"queue":0,"running":0}
         status["latency_ms"]=latency; status["bandwidth_mbps"]=100.0
-        status["node" ]=name; rows.append((name,host,port,status))
-        csv_append(DATA/"metrics.csv", {"timestamp":time.time(),"node":name,**{k:status.get(k,0) for k in ("cpu_percent","ram_percent","memory_mb","queue","running","latency_ms","bandwidth_mbps")}})
+        status["node"]=name; rows.append((name,host,port,status))
+        csv_append(DATA/"metrics.csv", {"timestamp":time.time(),"node":name,**{k:status.get(k,0) for k in ("cpu_percent","ram_percent","memory_mb","queue","running","latency_ms","bandwidth_mbps","enabled","load_percent")}})
     return rows
 def train_rf():
     try:
@@ -75,9 +79,11 @@ def load_federated_predictor():
     return model
 
 def dispatch(task, policy, rr_index=0, verbose=True):
-    rows=collect(); chosen=rows[0]
-    if policy=="round_robin": chosen=rows[rr_index%len(rows)]
-    elif policy=="least_loaded": chosen=min(rows,key=lambda r:r[3]["cpu_percent"]+r[3]["ram_percent"]*.25+r[3]["queue"]*20+r[3]["running"]*30)
+    rows=collect(); available=[r for r in rows if r[3].get("ok") and r[3].get("enabled",True)]
+    pool=rows if policy=="local" else available
+    chosen=pool[0] if pool else None
+    if policy=="round_robin" and pool: chosen=pool[rr_index%len(pool)]
+    elif policy=="least_loaded" and pool: chosen=min(pool,key=lambda r:r[3]["cpu_percent"]+r[3]["ram_percent"]*.25+r[3]["queue"]*20+r[3]["running"]*30)
     elif policy in ("central_ml","federated_ml"):
         model_path=DATA/("federated_model.pt" if policy=="federated_ml" else "central_model.joblib")
         if model_path.exists():
@@ -90,7 +96,8 @@ def dispatch(task, policy, rr_index=0, verbose=True):
                 predicted_exec=[infer(model,federated_task_features(task,r[3])) for r in rows]
             # Estimate total completion from predicted execution plus current network and queue state.
             scores=[]
-            for predicted,r in zip(predicted_exec,rows):
+            candidates=[r for r in rows if r in available]
+            for predicted,r in zip([predicted_exec[rows.index(r)] for r in candidates],candidates):
                 metrics=r[3]; queued=float(metrics["queue"]); running=float(metrics["running"])
                 queue_wait=max(0.0,queued+running-1.0)*predicted/2.0
                 if float(task.get("size",0)) < 16000:
@@ -102,18 +109,25 @@ def dispatch(task, policy, rr_index=0, verbose=True):
                     # Both learned policies share a runtime-load prior for heavy tasks.
                     load_penalty=CPU_LOAD_PENALTY_MS_PER_PERCENT*max(0.0,float(metrics["cpu_percent"]))
                 scores.append(execution_weight*predicted+latency_weight*float(metrics["latency_ms"])+queue_wait+load_penalty)
-            chosen=rows[min(range(len(rows)),key=lambda i:scores[i])]
-            if chosen[0]!="node1" and scores[0] <= scores[rows.index(chosen)]: chosen=rows[0]
+            if candidates: chosen=candidates[min(range(len(candidates)),key=lambda i:scores[i])]
         else: raise FileNotFoundError(f"Missing {policy} model: {model_path}. Train the model before selecting this policy.")
-    name,host,port,metrics=chosen
-    start_timestamp=time.time(); started=time.perf_counter(); result=send_request(host,port,{"action":"run","task":task}); total=(time.perf_counter()-started)*1000
-    finish_timestamp=time.time(); transfer=max(0,total-result.get("execution_ms",0)); row={"timestamp":finish_timestamp,"start_timestamp":start_timestamp,"finish_timestamp":finish_timestamp,"task_id":task["task_id"],"method":policy,"node":name,
-        "kind":task["kind"],"size":task["size"],"execution_ms":result.get("execution_ms",0),"completion_ms":total,
-        "transfer_ms":transfer,"ok":result.get("ok",False)}
+    start_timestamp=time.time()
+    if chosen is None or (policy=="local" and (not chosen[3].get("ok") or not chosen[3].get("enabled",True))):
+        name=chosen[0] if chosen else "none"; metrics=chosen[3] if chosen else {}
+        result={"ok":False,"error":"No enabled worker available" if chosen is None else "Local baseline node1 is unavailable"}; total=execution=transfer=float("nan")
+    else:
+        name,host,port,metrics=chosen; started=time.perf_counter()
+        try: result=send_request(host,port,{"action":"run","task":task},timeout=30)
+        except Exception as error: result={"ok":False,"error":str(error)}
+        total=(time.perf_counter()-started)*1000; execution=result.get("execution_ms",float("nan"))
+        transfer=max(0,total-execution) if math.isfinite(float(execution)) else float("nan")
+    finish_timestamp=time.time(); row={"timestamp":finish_timestamp,"start_timestamp":start_timestamp,"finish_timestamp":finish_timestamp,"task_id":task["task_id"],"method":policy,"node":name,
+        "kind":task["kind"],"size":task["size"],"execution_ms":execution,"completion_ms":total,
+        "transfer_ms":transfer,"ok":result.get("ok",False),"error":result.get("error","")}
     row["experiment_id"]=task.get("experiment_id",""); row["run_id"]=task.get("run_id","")
     csv_append(DATA/"results.csv",row)
     # Keep comparison tasks out of training data; otherwise rerunning a benchmark leaks its evaluation rows.
-    if not task.get("experiment_id"):
+    if not task.get("experiment_id") and result.get("ok"):
         csv_append(DATA/"workload.csv", {**dict(zip(FEATURES,task_features(task,metrics))),"kind":task["kind"],
             "condition":task.get("condition","normal"),"execution_ms":result.get("execution_ms",0),"completion_ms":total,
             "node":name,"task_id":task["task_id"]})
@@ -149,17 +163,19 @@ def start_load_profile(duration_s, max_memory_mb, label):
 def summarize_heavy_comparison(experiment_id, rows):
     grouped={}
     for row in rows: grouped.setdefault(row["method"],[]).append(row)
-    baseline=statistics.mean(float(row["completion_ms"]) for row in grouped.get("least_loaded",[]))
+    baseline_values=[float(row["completion_ms"]) for row in grouped.get("least_loaded",[]) if row.get("ok") and math.isfinite(float(row["completion_ms"]))]
+    baseline=statistics.mean(baseline_values) if baseline_values else float("nan")
     out=[]
     for policy,items in grouped.items():
-        completion=sorted(float(item["completion_ms"]) for item in items)
-        execution=[float(item["execution_ms"]) for item in items]
-        mean=statistics.mean(completion)
-        out.append({"experiment_id":experiment_id,"policy":policy,"tasks":len(items),
-            "avg_completion_ms":mean,"median_completion_ms":statistics.median(completion),
-            "p95_completion_ms":completion[min(len(completion)-1,math.ceil(.95*len(completion))-1)],
-            "avg_execution_ms":statistics.mean(execution),"success_rate":sum(bool(item["ok"]) for item in items)/len(items),
-            "speedup_vs_least_loaded":baseline/mean if baseline>0 else ""})
+        successful=[item for item in items if item.get("ok") and math.isfinite(float(item["completion_ms"]))]
+        completion=sorted(float(item["completion_ms"]) for item in successful)
+        execution=[float(item["execution_ms"]) for item in successful]
+        mean=statistics.mean(completion) if completion else float("nan")
+        out.append({"experiment_id":experiment_id,"policy":policy,"tasks":len(successful),"attempts":len(items),
+            "avg_completion_ms":mean,"median_completion_ms":statistics.median(completion) if completion else float("nan"),
+            "p95_completion_ms":completion[min(len(completion)-1,math.ceil(.95*len(completion))-1)] if completion else float("nan"),
+            "avg_execution_ms":statistics.mean(execution) if execution else float("nan"),"success_rate":len(successful)/len(items),
+            "speedup_vs_least_loaded":baseline/mean if math.isfinite(baseline) and mean>0 else ""})
     for row in out: csv_append(DATA/"heavy_comparison.csv",row)
     print(json.dumps(out,indent=2))
 
@@ -170,7 +186,7 @@ def main():
     q=sub.add_parser("train-ml")
     q=sub.add_parser("collect-dataset"); q.add_argument("--repeats",type=int,default=3); q.add_argument("--seed",type=int,default=101)
     q=sub.add_parser("collect-heavy-dataset"); q.add_argument("--repeats",type=int,default=4); q.add_argument("--seed",type=int,default=101)
-    q=sub.add_parser("demo-heavy"); q.add_argument("--kind",choices=KINDS,default="matrix"); q.add_argument("--size",type=int,default=500000); q.add_argument("--count",type=int,default=2); q.add_argument("--duration",type=int,default=12); q.add_argument("--memory-mb",type=int,default=96); q.add_argument("--policy",choices=["compare","local","round_robin","least_loaded","central_ml","federated_ml"],default="compare"); q.add_argument("--seed",type=int,default=101)
+    q=sub.add_parser("demo-heavy"); q.add_argument("--kind",choices=KINDS,default="matrix"); q.add_argument("--size",type=int,default=500000); q.add_argument("--count",type=int,default=2); q.add_argument("--duration",type=int,default=12); q.add_argument("--memory-mb",type=int,default=96); q.add_argument("--policy",choices=["compare","local","round_robin","least_loaded","central_ml","federated_ml"],default="compare"); q.add_argument("--seed",type=int,default=101); q.add_argument("--use-node-controls",action="store_true",help="use dashboard load and availability settings instead of starting automatic demo loads")
     a=p.parse_args()
     if a.cmd=="status":
         for r in collect(): print(json.dumps(r[3],indent=2))
@@ -219,18 +235,19 @@ def main():
         if missing: raise SystemExit("Cannot run comparison: missing " + "; ".join(missing))
         experiment_id=f"heavy-{time.time_ns()}"; policies_order=list(policies); random.Random(a.seed).shuffle(policies_order)
         print(f"Experiment {experiment_id}: same {a.kind}/{a.size} task set for {', '.join(policies_order)}")
-        print("Each policy gets a fresh, varied four-node load profile: node1 is busiest; node4 is least busy.")
+        if a.use_node_controls: print("Using the current dashboard node load and availability settings for every policy.")
+        else: print("Each policy gets a fresh, varied four-node load profile: node1 is busiest; node4 is least busy.")
         rows=[]
         task_defs=[{"kind":a.kind,"size":a.size,"complexity":KINDS.index(a.kind)+1,
                     "seed":a.seed+i,"condition":"heavy-comparison"} for i in range(a.count)]
         load_duration=max(a.duration,a.count*7+2 if a.kind=="matrix" else a.count*2+2)
         for policy in policies_order:
             print(f"\nRunning policy: {policy}")
-            load_profile=start_load_profile(load_duration,a.memory_mb,policy)
+            load_profile=None if a.use_node_controls else start_load_profile(load_duration,a.memory_mb,policy)
             for i,base_task in enumerate(task_defs):
                 task={**base_task,"task_id":f"{experiment_id}-{policy}-{i}","experiment_id":experiment_id}
                 rows.append(dispatch(task,policy,i))
-            time.sleep(max(0,load_profile["finish_at"]-time.time()))
+            if load_profile: time.sleep(max(0,load_profile["finish_at"]-time.time()))
         summarize_heavy_comparison(experiment_id,rows)
     elif a.cmd=="run":
         run_id=f"normal-{time.time_ns()}"
@@ -254,8 +271,12 @@ def summarize(since=None):
     if since is not None: rows=[r for r in rows if float(r["timestamp"])>=since]
     methods=sorted(set(r["method"] for r in rows)); out=[]
     for method in methods:
-        values=[float(r["completion_ms"]) for r in rows if r["method"]==method]; ordered=sorted(values)
-        out.append({"method":method,"tasks":len(values),"avg_completion_ms":statistics.mean(values),"p95_ms":ordered[min(len(ordered)-1,math.ceil(.95*len(ordered))-1)],"throughput_per_s":1000/statistics.mean(values),"deadline_success_rate":sum(v<=5000 for v in values)/len(values)})
+        attempts=[r for r in rows if r["method"]==method]
+        values=[float(r["completion_ms"]) for r in attempts if str(r.get("ok", "true")).lower() in ("true","1") and math.isfinite(float(r["completion_ms"]))]
+        ordered=sorted(values); mean=statistics.mean(values) if values else float("nan")
+        out.append({"method":method,"tasks":len(values),"attempts":len(attempts),"success_rate":len(values)/len(attempts) if attempts else 0,
+            "avg_completion_ms":mean,"p95_ms":ordered[min(len(ordered)-1,math.ceil(.95*len(ordered))-1)] if ordered else float("nan"),
+            "throughput_per_s":1000/mean if mean>0 else float("nan"),"deadline_success_rate":sum(v<=5000 for v in values)/len(attempts) if attempts else 0})
     with (DATA/"summary.csv").open("w",newline="",encoding="utf-8") as f:
         w=csv.DictWriter(f,fieldnames=list(out[0])); w.writeheader(); w.writerows(out)
     print(json.dumps(out,indent=2))
